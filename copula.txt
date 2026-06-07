@@ -1,0 +1,949 @@
+# 加载必要的包
+library(fitdistrplus)
+library(copula)
+library(ggplot2)
+library(openxlsx)
+library(viridis)
+library(progress)
+
+# 1. 数据准备函数 - 从Excel文件加载实际数据
+prepare_data <- function() {
+  # 设置数据路径
+  data_path <- "C:/Users/Administrator/Desktop/rch2.xlsx"
+  
+  # 读取Excel数据
+  cat("正在从以下路径加载数据:", data_path, "\n")
+  data <- read.xlsx(data_path)
+  
+  # 重命名列以匹配要求
+  colnames(data)[1] <- "Basin"
+  colnames(data)[4] <- "Y"
+  colnames(data)[5] <- "X"
+  
+  # 验证数据结构
+  if (!all(c("Basin", "X", "Y") %in% names(data))) {
+    stop("数据必须包含'Basin', 'X'和'Y'列")
+  }
+  
+  # 检查流域数量
+  basin_count <- length(unique(data$Basin))
+  if (basin_count != 44) {
+    warning(sprintf("数据包含%d个流域，但期望44个流域", basin_count))
+  }
+  
+  # 检查每个流域的观测值数量
+  basin_obs <- table(data$Basin)
+  if (any(basin_obs != 60)) {
+    warning("部分流域的观测值数量不等于60")
+    print(table(basin_obs))
+  }
+  
+  cat(sprintf("成功加载数据: %d行, %d个流域\n", nrow(data), basin_count))
+  
+  return(data)
+}
+
+# 2. 增强版边际分布拟合函数
+fit_and_evaluate <- function(data, dist_names = c("norm", "lnorm", "gamma", "weibull")) {
+  results <- list()
+  
+  for (dist in dist_names) {
+    tryCatch({
+      if (dist == "norm") {
+        fit <- fitdist(data, "norm")
+      } else if (dist == "lnorm") {
+        fit <- fitdist(data, "lnorm")
+      } else if (dist == "gamma") {
+        fit <- fitdist(data, "gamma", start = list(shape = 1, rate = 0.1))
+      } else if (dist == "weibull") {
+        fit <- fitdist(data, "weibull", start = list(shape = 1, scale = 1))
+      }
+      
+      results[[dist]] <- list(
+        fit = fit,
+        aic = AIC(fit),
+        bic = BIC(fit),
+        loglik = logLik(fit),
+        params = fit$estimate,
+        error = NULL
+      )
+    }, error = function(e) {
+      results[[dist]] <<- list(error = e$message)
+    })
+  }
+  
+  # 选择最优分布
+  aics <- sapply(results, function(x) if (!is.null(x$aic)) x$aic else Inf)
+  best_index <- which.min(aics)
+  best_dist <- names(results)[best_index]
+  
+  list(
+    all_results = results,
+    best_dist = best_dist,
+    best_fit = results[[best_index]]
+  )
+}
+
+# 3. 模型选择不确定性分析函数（优化版）
+model_selection_uncertainty_analysis <- function(X_pos, Y_pos, best_X, best_Y, n_iter = 1000) {
+  n <- length(X_pos)
+  selected_copulas <- character(n_iter)
+  valid_iterations <- 0
+  iteration <- 0
+  copula_names <- c("正态", "t", "Gumbel", "Clayton", "Frank")
+  
+  # 进度条初始化
+  pb <- progress_bar$new(
+    format = "不确定性分析 [:bar] :percent | 耗时: :elapsed",
+    total = n_iter, clear = FALSE, width = 80
+  )
+  
+  while (valid_iterations < n_iter && iteration < n_iter * 2) {
+    iteration <- iteration + 1
+    
+    # 重采样
+    idx <- sample(1:n, n, replace = TRUE)
+    X_resampled <- X_pos[idx]
+    Y_resampled <- Y_pos[idx]
+    
+    # 计算 Kendall's tau
+    tau <- tryCatch({
+      cor(X_resampled, Y_resampled, method = "kendall")
+    }, error = function(e) NA)
+    
+    # 拟合X的边际分布
+    fit_X_result <- tryCatch({
+      if (best_X$dist_name == "正态") {
+        fit <- fitdist(X_resampled, "norm")
+      } else if (best_X$dist_name == "对数正态") {
+        fit <- fitdist(X_resampled, "lnorm")
+      } else if (best_X$dist_name == "Gamma") {
+        fit <- fitdist(X_resampled, "gamma", start = list(shape = 1, rate = 0.1))
+      } else if (best_X$dist_name == "Weibull") {
+        fit <- fitdist(X_resampled, "weibull", start = list(shape = 1, scale = 1))
+      }
+      list(fit = fit, error = NULL)
+    }, error = function(e) {
+      list(fit = NULL, error = e$message)
+    })
+    
+    # 拟合Y的边际分布
+    fit_Y_result <- tryCatch({
+      if (best_Y$dist_name == "正态") {
+        fit <- fitdist(Y_resampled, "norm")
+      } else if (best_Y$dist_name == "对数正态") {
+        fit <- fitdist(Y_resampled, "lnorm")
+      } else if (best_Y$dist_name == "Gamma") {
+        fit <- fitdist(Y_resampled, "gamma", start = list(shape = 1, rate = 0.1))
+      } else if (best_Y$dist_name == "Weibull") {
+        fit <- fitdist(Y_resampled, "weibull", start = list(shape = 1, scale = 1))
+      }
+      list(fit = fit, error = NULL)
+    }, error = function(e) {
+      list(fit = NULL, error = e$message)
+    })
+    
+    # 检查拟合是否成功
+    if (!is.null(fit_X_result$error)) { next }
+    if (!is.null(fit_Y_result$error)) { next }
+    if (is.null(fit_X_result$fit) || any(is.na(fit_X_result$fit$estimate))) { next }
+    if (is.null(fit_Y_result$fit) || any(is.na(fit_Y_result$fit$estimate))) { next }
+    
+    # 概率积分变换
+    U <- switch(best_X$dist_name,
+                "正态" = pnorm(X_resampled, mean = fit_X_result$fit$estimate[1], sd = fit_X_result$fit$estimate[2]),
+                "对数正态" = plnorm(X_resampled, meanlog = fit_X_result$fit$estimate[1], sdlog = fit_X_result$fit$estimate[2]),
+                "Gamma" = pgamma(X_resampled, shape = fit_X_result$fit$estimate[1], rate = fit_X_result$fit$estimate[2]),
+                "Weibull" = pweibull(X_resampled, shape = fit_X_result$fit$estimate[1], scale = fit_X_result$fit$estimate[2])
+    )
+    
+    V <- switch(best_Y$dist_name,
+                "正态" = pnorm(Y_resampled, mean = fit_Y_result$fit$estimate[1], sd = fit_Y_result$fit$estimate[2]),
+                "对数正态" = plnorm(Y_resampled, meanlog = fit_Y_result$fit$estimate[1], sdlog = fit_Y_result$fit$estimate[2]),
+                "Gamma" = pgamma(Y_resampled, shape = fit_Y_result$fit$estimate[1], rate = fit_Y_result$fit$estimate[2]),
+                "Weibull" = pweibull(Y_resampled, shape = fit_Y_result$fit$estimate[1], scale = fit_Y_result$fit$estimate[2])
+    )
+    
+    # 检查概率值是否有效
+    if (any(is.na(U)) || any(U < 0 | U > 1)) { next }
+    if (any(is.na(V)) || any(V < 0 | V > 1)) { next }
+    
+    UV_resampled <- cbind(U, V)
+    
+    # 拟合Copula模型并选择最优 - 增强健壮性
+    tryCatch({
+      # 初始化拟合对象和AIC值
+      fit_objects <- list()
+      aic_values <- rep(Inf, 5)
+      names(aic_values) <- copula_names
+      
+      # 拟合正态Copula
+      fit_norm <- tryCatch({
+        fitCopula(normalCopula(dim = 2), data = UV_resampled, method = "mpl")
+      }, error = function(e) NULL)
+      if (!is.null(fit_norm)) {
+        fit_objects[["正态"]] <- fit_norm
+        aic_values["正态"] <- AIC(fit_norm)
+      }
+      
+      # 拟合t-Copula (抑制警告)
+      fit_t <- suppressWarnings(
+        tryCatch({
+          fitCopula(tCopula(dim = 2, df.fixed = FALSE), data = UV_resampled, method = "mpl")
+        }, error = function(e) NULL)
+      )
+      if (!is.null(fit_t)) {
+        fit_objects[["t"]] <- fit_t
+        aic_values["t"] <- AIC(fit_t)
+      }
+      
+      # 拟合Frank Copula
+      fit_frank <- tryCatch({
+        fitCopula(frankCopula(), data = UV_resampled, method = "mpl")
+      }, error = function(e) NULL)
+      if (!is.null(fit_frank)) {
+        fit_objects[["Frank"]] <- fit_frank
+        aic_values["Frank"] <- AIC(fit_frank)
+      }
+      
+      # 仅在正相关时拟合Gumbel和Clayton Copula
+      if (!is.na(tau) && tau >= 0) {
+        # 拟合Gumbel Copula
+        fit_gumbel <- tryCatch({
+          fitCopula(gumbelCopula(), data = UV_resampled, method = "mpl")
+        }, error = function(e) NULL)
+        if (!is.null(fit_gumbel)) {
+          fit_objects[["Gumbel"]] <- fit_gumbel
+          aic_values["Gumbel"] <- AIC(fit_gumbel)
+        }
+        
+        # 拟合Clayton Copula
+        fit_clayton <- tryCatch({
+          fitCopula(claytonCopula(), data = UV_resampled, method = "mpl")
+        }, error = function(e) NULL)
+        if (!is.null(fit_clayton)) {
+          fit_objects[["Clayton"]] <- fit_clayton
+          aic_values["Clayton"] <- AIC(fit_clayton)
+        }
+      }
+      
+      # 选择最优Copula
+      best_index <- which.min(aic_values)
+      selected_copulas[valid_iterations + 1] <- names(aic_values)[best_index]
+      
+      valid_iterations <- valid_iterations + 1
+      pb$tick()
+    }, error = function(e) {
+      # 忽略Copula拟合错误
+    })
+  }
+  
+  # 计算频率
+  if (valid_iterations == 0) {
+    warning("没有有效的迭代完成")
+    freq_df <- data.frame(
+      Copula = copula_names,
+      Frequency = 0,
+      Proportion = 0
+    )
+  } else {
+    # 确保所有Copula类型都在结果中
+    freq_table <- table(factor(selected_copulas[1:valid_iterations], levels = copula_names))
+    freq_df <- data.frame(
+      Copula = names(freq_table),
+      Frequency = as.numeric(freq_table),
+      Proportion = as.numeric(freq_table) / valid_iterations
+    )
+  }
+  
+  # 按比例排序
+  freq_df <- freq_df[order(-freq_df$Proportion), ]
+  
+  list(
+    frequency_table = freq_df,
+    valid_iterations = valid_iterations,
+    total_iterations = iteration
+  )
+}
+
+# 4. 生成Copula密度函数数据的函数
+generate_copula_density_data <- function() {
+  cat("\n===== 开始生成Copula密度函数数据 =====\n")
+  
+  # 检查是否有最终结果
+  if (!exists("final_results")) {
+    cat("错误：未找到分析结果，请先运行主分析函数\n")
+    return(NULL)
+  }
+  
+  # 检查是否有成功的流域
+  success_count <- sum(final_results$summary$Status == "成功")
+  if (success_count == 0) {
+    cat("没有成功的流域分析，无法生成Copula密度数据\n")
+    return(NULL)
+  }
+  
+  # 创建存储密度数据的列表
+  density_data_list <- list()
+  
+  # 遍历所有成功的流域
+  for (i in 1:nrow(final_results$summary)) {
+    basin <- final_results$summary$Basin[i]
+    status <- final_results$summary$Status[i]
+    
+    if (status == "成功") {
+      cat(sprintf("处理流域 %d/%d: %s\n", i, nrow(final_results$summary), basin))
+      
+      # 获取该流域的分析结果
+      basin_result <- final_results$results[[basin]]
+      
+      if (!is.null(basin_result$copula)) {
+        # 获取最优Copula类型和参数
+        best_copula <- basin_result$copula$best_copula
+        best_params <- basin_result$copula$params
+        
+        # 根据Copula类型创建Copula对象
+        copula_obj <- NULL
+        params <- NULL
+        
+        if (best_copula == "正态") {
+          if (!is.na(best_params$norm[1])) {
+            params <- best_params$norm[1]
+            copula_obj <- normalCopula(param = params, dim = 2)
+          }
+        } else if (best_copula == "t") {
+          if (!is.na(best_params$t[1])) {
+            params <- best_params$t[1]
+            copula_obj <- tCopula(param = params, df = 4, dim = 2)  # df固定为4，可根据需要调整
+          }
+        } else if (best_copula == "Gumbel") {
+          if (!is.na(best_params$gumbel[1])) {
+            params <- best_params$gumbel[1]
+            copula_obj <- gumbelCopula(param = params, dim = 2)
+          }
+        } else if (best_copula == "Clayton") {
+          if (!is.na(best_params$clayton[1])) {
+            params <- best_params$clayton[1]
+            copula_obj <- claytonCopula(param = params, dim = 2)
+          }
+        } else if (best_copula == "Frank") {
+          if (!is.na(best_params$frank[1])) {
+            params <- best_params$frank[1]
+            copula_obj <- frankCopula(param = params, dim = 2)
+          }
+        }
+        
+        if (!is.null(copula_obj)) {
+          # 生成网格点
+          n_grid <- 50
+          u <- seq(0.01, 0.99, length.out = n_grid)
+          v <- seq(0.01, 0.99, length.out = n_grid)
+          grid <- expand.grid(u = u, v = v)
+          
+          # 计算Copula密度
+          density_values <- tryCatch({
+            dCopula(as.matrix(cbind(grid$u, grid$v)), copula_obj)
+          }, error = function(e) {
+            rep(NA, nrow(grid))
+          })
+          
+          # 创建数据框
+          density_data <- data.frame(
+            u = grid$u,
+            v = grid$v,
+            density = density_values
+          )
+          
+          # 添加到列表
+          density_data_list[[basin]] <- list(
+            basin = basin,
+            copula_type = best_copula,
+            copula_param = params,
+            density_data = density_data,
+            grid_size = n_grid
+          )
+          
+          # 保存为CSV文件
+          csv_file <- paste0("Copula_Density_", basin, ".csv")
+          write.csv(density_data, csv_file, row.names = FALSE)
+          cat(sprintf("  密度数据已保存到: %s\n", csv_file))
+        } else {
+          cat(sprintf("  %s: 无法创建Copula对象\n", basin))
+        }
+      } else {
+        cat(sprintf("  %s: 没有Copula结果\n", basin))
+      }
+    }
+  }
+  
+  # 汇总结果
+  cat("\n===== Copula密度数据生成完成 =====\n")
+  cat(sprintf("成功生成密度数据的流域: %d/%d\n", 
+              length(density_data_list), success_count))
+  
+  # 保存所有密度数据到RData文件
+  if (length(density_data_list) > 0) {
+    save(density_data_list, file = "Copula_Density_Data.RData")
+    cat("所有密度数据已保存到: Copula_Density_Data.RData\n")
+  }
+  
+  return(density_data_list)
+}
+
+# 5. 主分析函数（移除可视化部分）
+perform_copula_analysis <- function() {
+  # 准备数据
+  data <- prepare_data()
+  basin_names <- unique(data$Basin)
+  total_basins <- length(basin_names)
+  
+  # 初始化结果存储
+  results_list <- list()
+  error_log <- character(0)
+  success_count <- 0
+  copula_counts <- list("正态" = 0, "t" = 0, "Gumbel" = 0, "Clayton" = 0, "Frank" = 0)
+  
+  # 创建Excel工作簿
+  wb <- createWorkbook()
+  summary_df <- data.frame(
+    Basin = character(total_basins),
+    Best_Marginal_X = character(total_basins),
+    Best_Marginal_Y = character(total_basins),
+    Best_Copula = character(total_basins),
+    Uncertainty_Top_Copula = character(total_basins),
+    Uncertainty_Top_Prop = numeric(total_basins),
+    Valid_Iterations = integer(total_basins),
+    Status = character(total_basins),
+    stringsAsFactors = FALSE
+  )
+  
+  # 开始流域循环
+  for (i in 1:total_basins) {
+    basin <- basin_names[i]
+    basin_data <- data[data$Basin == basin, ]
+    group_name <- as.character(basin)
+    
+    cat("\n===== 开始分析:", group_name, "=====\n")
+    basin_results <- list(
+      basin = group_name,
+      status = "成功",
+      marginal_X = NULL,
+      marginal_Y = NULL,
+      copula = NULL,
+      uncertainty = NULL
+    )
+    
+    tryCatch({
+      # 提取变量数据
+      X <- basin_data$X
+      Y <- basin_data$Y
+      
+      # 确保正值（Copula分析要求）
+      X_pos <- X - min(X) + 0.01 * sd(X)
+      Y_pos <- Y - min(Y) + 0.01 * sd(Y)
+      
+      # 拟合X的边际分布
+      cat("拟合X的边际分布...\n")
+      marginal_X <- fit_and_evaluate(X_pos)
+      best_X_name <- switch(marginal_X$best_dist,
+                            "norm" = "正态",
+                            "lnorm" = "对数正态",
+                            "gamma" = "Gamma",
+                            "weibull" = "Weibull")
+      
+      # 拟合Y的边际分布
+      cat("拟合Y的边际分布...\n")
+      marginal_Y <- fit_and_evaluate(Y_pos)
+      best_Y_name <- switch(marginal_Y$best_dist,
+                            "norm" = "正态",
+                            "lnorm" = "对数正态",
+                            "gamma" = "Gamma",
+                            "weibull" = "Weibull")
+      
+      # 保存结果
+      basin_results$marginal_X <- list(
+        best_dist = best_X_name,
+        params = marginal_X$best_fit$params,
+        aic = marginal_X$best_fit$aic
+      )
+      
+      basin_results$marginal_Y <- list(
+        best_dist = best_Y_name,
+        params = marginal_Y$best_fit$params,
+        aic = marginal_Y$best_fit$aic
+      )
+      
+      # 概率积分变换
+      U <- switch(best_X_name,
+                  "正态" = pnorm(X_pos, mean = marginal_X$best_fit$fit$estimate[1], sd = marginal_X$best_fit$fit$estimate[2]),
+                  "对数正态" = plnorm(X_pos, meanlog = marginal_X$best_fit$fit$estimate[1], sdlog = marginal_X$best_fit$fit$estimate[2]),
+                  "Gamma" = pgamma(X_pos, shape = marginal_X$best_fit$fit$estimate[1], rate = marginal_X$best_fit$fit$estimate[2]),
+                  "Weibull" = pweibull(X_pos, shape = marginal_X$best_fit$fit$estimate[1], scale = marginal_X$best_fit$fit$estimate[2])
+      )
+      
+      V <- switch(best_Y_name,
+                  "正态" = pnorm(Y_pos, mean = marginal_Y$best_fit$fit$estimate[1], sd = marginal_Y$best_fit$fit$estimate[2]),
+                  "对数正态" = plnorm(Y_pos, meanlog = marginal_Y$best_fit$fit$estimate[1], sdlog = marginal_Y$best_fit$fit$estimate[2]),
+                  "Gamma" = pgamma(Y_pos, shape = marginal_Y$best_fit$fit$estimate[1], rate = marginal_Y$best_fit$fit$estimate[2]),
+                  "Weibull" = pweibull(Y_pos, shape = marginal_Y$best_fit$fit$estimate[1], scale = marginal_Y$best_fit$fit$estimate[2])
+      )
+      
+      UV <- cbind(U, V)
+      
+      # 拟合Copula模型
+      cat("拟合Copula模型...\n")
+      
+      # 计算Kendall's tau以确定相关性方向
+      tau <- cor(X_pos, Y_pos, method = "kendall")
+      
+      # 初始化拟合对象和AIC值
+      fit_objects <- list()
+      aic_values <- rep(Inf, 5)
+      names(aic_values) <- c("正态", "t", "Gumbel", "Clayton", "Frank")
+      
+      # 拟合正态Copula
+      fit_norm <- tryCatch({
+        fitCopula(normalCopula(dim = 2), data = UV, method = "mpl")
+      }, error = function(e) NULL)
+      if (!is.null(fit_norm)) {
+        fit_objects[["正态"]] <- fit_norm
+        aic_values["正态"] <- AIC(fit_norm)
+      }
+      
+      # 拟合t-Copula (抑制警告)
+      fit_t <- suppressWarnings(
+        tryCatch({
+          fitCopula(tCopula(dim = 2, df.fixed = FALSE), data = UV, method = "mpl")
+        }, error = function(e) NULL)
+      )
+      if (!is.null(fit_t)) {
+        fit_objects[["t"]] <- fit_t
+        aic_values["t"] <- AIC(fit_t)
+      }
+      
+      # 拟合Frank Copula
+      fit_frank <- tryCatch({
+        fitCopula(frankCopula(), data = UV, method = "mpl")
+      }, error = function(e) NULL)
+      if (!is.null(fit_frank)) {
+        fit_objects[["Frank"]] <- fit_frank
+        aic_values["Frank"] <- AIC(fit_frank)
+      }
+      
+      # 仅在正相关时拟合Gumbel和Clayton Copula
+      if (!is.na(tau) && tau >= 0) {
+        # 拟合Gumbel Copula
+        fit_gumbel <- tryCatch({
+          fitCopula(gumbelCopula(), data = UV, method = "mpl")
+        }, error = function(e) NULL)
+        if (!is.null(fit_gumbel)) {
+          fit_objects[["Gumbel"]] <- fit_gumbel
+          aic_values["Gumbel"] <- AIC(fit_gumbel)
+        }
+        
+        # 拟合Clayton Copula
+        fit_clayton <- tryCatch({
+          fitCopula(claytonCopula(), data = UV, method = "mpl")
+        }, error = function(e) NULL)
+        if (!is.null(fit_clayton)) {
+          fit_objects[["Clayton"]] <- fit_clayton
+          aic_values["Clayton"] <- AIC(fit_clayton)
+        }
+      }
+      
+      # 选择最优Copula
+      best_index <- which.min(aic_values)
+      best_copula <- names(aic_values)[best_index]
+      
+      # 提取参数（仅当拟合成功时）
+      get_params <- function(fit) {
+        if (!is.null(fit)) {
+          tryCatch({
+            fit@estimate
+          }, error = function(e) NA)
+        } else {
+          NA
+        }
+      }
+      
+      basin_results$copula <- list(
+        best_copula = best_copula,
+        aic_values = aic_values,
+        tau = tau,
+        params = list(
+          norm = get_params(fit_objects[["正态"]]),
+          t = get_params(fit_objects[["t"]]),
+          gumbel = get_params(fit_objects[["Gumbel"]]),
+          clayton = get_params(fit_objects[["Clayton"]]),
+          frank = get_params(fit_objects[["Frank"]])
+        )
+      )
+      
+      # 模型选择不确定性分析
+      cat("进行模型选择不确定性分析...\n")
+      uncertainty_results <- model_selection_uncertainty_analysis(
+        X_pos, Y_pos,
+        best_X = list(dist_name = best_X_name),
+        best_Y = list(dist_name = best_Y_name),
+        n_iter = 1000
+      )
+      
+      basin_results$uncertainty <- uncertainty_results
+      
+      # 更新成功计数和Copula统计
+      success_count <- success_count + 1
+      copula_counts[[best_copula]] <- copula_counts[[best_copula]] + 1
+      
+      cat(group_name, "分析完成!\n")
+      
+    }, error = function(e) {
+      error_msg <- paste(group_name, "分析失败:", e$message)
+      basin_results$status <<- paste("失败:", e$message)
+      error_log <<- c(error_log, error_msg)
+      cat(error_msg, "\n")
+    })
+    
+    # 保存结果
+    results_list[[group_name]] <- basin_results
+    
+    # 更新摘要数据
+    summary_df$Basin[i] <- group_name
+    if (basin_results$status == "成功") {
+      summary_df$Best_Marginal_X[i] <- basin_results$marginal_X$best_dist
+      summary_df$Best_Marginal_Y[i] <- basin_results$marginal_Y$best_dist
+      summary_df$Best_Copula[i] <- basin_results$copula$best_copula
+      summary_df$Uncertainty_Top_Copula[i] <- basin_results$uncertainty$frequency_table$Copula[1]
+      summary_df$Uncertainty_Top_Prop[i] <- basin_results$uncertainty$frequency_table$Proportion[1]
+      summary_df$Valid_Iterations[i] <- basin_results$uncertainty$valid_iterations
+      summary_df$Status[i] <- "成功"
+    } else {
+      summary_df$Status[i] <- basin_results$status
+    }
+    
+    # 每5个流域清理一次内存
+    if (i %% 5 == 0) gc()
+    
+    # 进度报告
+    cat(sprintf("进度: %d/%d (%.1f%%) | 成功率: %.1f%%\n",
+                i, total_basins, i/total_basins*100,
+                success_count/i*100))
+  }
+  
+  # 最终验证报告
+  cat("\n===== 分析完成报告 =====\n")
+  cat("• 总流域数:", total_basins, "\n")
+  cat("• 成功分析:", success_count, "\n")
+  cat("• 失败分析:", total_basins - success_count, "\n")
+  
+  if (length(error_log) > 0) {
+    cat("\n===== 错误详情 =====\n")
+    writeLines(error_log)
+    writeLines(error_log, "analysis_errors.log")
+  }
+  
+  # Copula选择分布
+  cat("\n===== Copula选择分布 =====\n")
+  copula_distribution <- data.frame(
+    Copula = names(copula_counts),
+    Count = unlist(copula_counts),
+    Proportion = unlist(copula_counts) / success_count
+  )
+  print(copula_distribution)
+  
+  # 保存Excel结果
+  addWorksheet(wb, "流域摘要")
+  writeData(wb, "流域摘要", summary_df)
+  
+  for (basin in names(results_list)) {
+    basin_results <- results_list[[basin]]
+    addWorksheet(wb, basin)
+    
+    if (basin_results$status == "成功") {
+      # 写入边际分布结果
+      writeData(wb, basin, "X变量边际分布", startRow = 1)
+      writeData(wb, basin, data.frame(
+        分布 = basin_results$marginal_X$best_dist,
+        参数 = paste(names(basin_results$marginal_X$params), 
+                   round(basin_results$marginal_X$params, 4), collapse = "; "),
+        AIC = round(basin_results$marginal_X$aic, 2)
+      ), startRow = 2)
+      
+      writeData(wb, basin, "Y变量边际分布", startRow = 5)
+      writeData(wb, basin, data.frame(
+        分布 = basin_results$marginal_Y$best_dist,
+        参数 = paste(names(basin_results$marginal_Y$params), 
+                   round(basin_results$marginal_Y$params, 4), collapse = "; "),
+        AIC = round(basin_results$marginal_Y$aic, 2)
+      ), startRow = 6)
+      
+      # 写入Copula结果
+      writeData(wb, basin, "Copula模型选择", startRow = 9)
+      copula_df <- data.frame(
+        Copula = c("正态", "t", "Gumbel", "Clayton", "Frank"),
+        AIC = round(basin_results$copula$aic_values, 2),
+        Kendall_tau = ifelse(rep(!is.na(basin_results$copula$tau), 5), basin_results$copula$tau, NA)
+      )
+      writeData(wb, basin, copula_df, startRow = 10)
+      
+      writeData(wb, basin, paste("最优Copula:", basin_results$copula$best_copula), startRow = 17)
+      writeData(wb, basin, paste("Kendall's tau:", round(basin_results$copula$tau, 4)), startRow = 18)
+      
+      # 写入不确定性分析
+      writeData(wb, basin, "模型选择不确定性分析", startRow = 20)
+      writeData(wb, basin, data.frame(
+        总迭代次数 = basin_results$uncertainty$total_iterations,
+        有效迭代次数 = basin_results$uncertainty$valid_iterations,
+        有效比例 = sprintf("%.1f%%", basin_results$uncertainty$valid_iterations / 
+                         basin_results$uncertainty$total_iterations * 100)
+      ), startRow = 21)
+      
+      writeData(wb, basin, "Copula选择频率", startRow = 25)
+      writeData(wb, basin, basin_results$uncertainty$frequency_table, startRow = 26)
+    } else {
+      writeData(wb, basin, paste("分析失败:", basin_results$status))
+    }
+  }
+  
+  # 添加Copula分布结果
+  if (success_count > 0) {
+    addWorksheet(wb, "Copula分布")
+    writeData(wb, "Copula分布", copula_distribution)
+  }
+  
+  # 保存工作簿
+  output_file <- "Copula_Analysis_Results.xlsx"
+  saveWorkbook(wb, output_file, overwrite = TRUE)
+  cat("\nExcel结果已保存到:", output_file, "\n")
+  
+  # 保存完整结果
+  save(results_list, summary_df, copula_distribution, file = "Copula_Analysis_Full_Results.RData")
+  cat("完整RData结果已保存到: Copula_Analysis_Full_Results.RData\n")
+  
+  # 返回结果
+  list(
+    results = results_list,
+    summary = summary_df,
+    copula_distribution = copula_distribution,
+    error_log = error_log
+  )
+}
+
+# 6. 执行分析
+final_results <- perform_copula_analysis()
+
+# 7. 最终验证
+cat("\n===== 最终验证 =====\n")
+cat("处理流域数量:", length(final_results$results), "\n")
+cat("成功流域数量:", sum(final_results$summary$Status == "成功"), "\n")
+cat("失败流域数量:", sum(final_results$summary$Status != "成功"), "\n")
+
+# 打印Copula分布摘要
+if (sum(final_results$summary$Status == "成功") > 0) {
+  cat("\nCopula分布摘要:\n")
+  print(final_results$copula_distribution)
+} else {
+  cat("\n没有成功的流域分析，无法提供Copula分布摘要\n")
+}
+
+# 8. 生成Copula密度函数数据
+cat("\n\n===== 开始生成Copula密度函数数据 =====\n")
+
+# 检查是否有最终结果
+if (!exists("final_results")) {
+  cat("错误：未找到分析结果，请先运行主分析函数\n")
+} else {
+  # 检查是否有成功的流域
+  success_count <- sum(final_results$summary$Status == "成功")
+  if (success_count == 0) {
+    cat("没有成功的流域分析，无法生成Copula密度数据\n")
+  } else {
+    # 创建存储密度数据的列表
+    density_data_list <- list()
+    density_summary <- data.frame(
+      Basin = character(0),
+      Copula_Type = character(0),
+      Copula_Param = numeric(0),
+      Grid_Size = integer(0),
+      Data_Points = integer(0),
+      Status = character(0),
+      stringsAsFactors = FALSE
+    )
+    
+    # 遍历所有成功的流域
+    for (i in 1:nrow(final_results$summary)) {
+      basin <- final_results$summary$Basin[i]
+      status <- final_results$summary$Status[i]
+      
+      if (status == "成功") {
+        cat(sprintf("处理流域 %d/%d: %s\n", i, nrow(final_results$summary), basin))
+        
+        # 获取该流域的分析结果
+        basin_result <- final_results$results[[basin]]
+        
+        if (!is.null(basin_result$copula)) {
+          # 获取最优Copula类型和参数
+          best_copula <- basin_result$copula$best_copula
+          best_params <- basin_result$copula$params
+          
+          # 根据Copula类型创建Copula对象
+          copula_obj <- NULL
+          params <- NA
+          
+          if (best_copula == "正态") {
+            if (!is.na(best_params$norm[1])) {
+              params <- best_params$norm[1]
+              copula_obj <- normalCopula(param = params, dim = 2)
+            }
+          } else if (best_copula == "t") {
+            if (!is.na(best_params$t[1])) {
+              params <- best_params$t[1]
+              # t-Copula需要两个参数：相关性和自由度
+              if (length(best_params$t) >= 2) {
+                df_param <- best_params$t[2]
+                copula_obj <- tCopula(param = params, df = df_param, dim = 2, df.fixed = FALSE)
+              } else {
+                copula_obj <- tCopula(param = params, df = 4, dim = 2, df.fixed = TRUE)
+              }
+            }
+          } else if (best_copula == "Gumbel") {
+            if (!is.na(best_params$gumbel[1])) {
+              params <- best_params$gumbel[1]
+              copula_obj <- gumbelCopula(param = params, dim = 2)
+            }
+          } else if (best_copula == "Clayton") {
+            if (!is.na(best_params$clayton[1])) {
+              params <- best_params$clayton[1]
+              copula_obj <- claytonCopula(param = params, dim = 2)
+            }
+          } else if (best_copula == "Frank") {
+            if (!is.na(best_params$frank[1])) {
+              params <- best_params$frank[1]
+              copula_obj <- frankCopula(param = params, dim = 2)
+            }
+          }
+          
+          if (!is.null(copula_obj)) {
+            tryCatch({
+              # 生成网格点
+              n_grid <- 50
+              u <- seq(0.01, 0.99, length.out = n_grid)
+              v <- seq(0.01, 0.99, length.out = n_grid)
+              grid <- expand.grid(u = u, v = v)
+              
+              # 计算Copula密度
+              density_values <- dCopula(as.matrix(cbind(grid$u, grid$v)), copula_obj)
+              
+              # 创建数据框
+              density_data <- data.frame(
+                u = grid$u,
+                v = grid$v,
+                density = density_values
+              )
+              
+              # 添加到列表
+              density_data_list[[basin]] <- list(
+                basin = basin,
+                copula_type = best_copula,
+                copula_param = params,
+                density_data = density_data,
+                grid_size = n_grid,
+                data_points = nrow(density_data)
+              )
+              
+              # 保存为CSV文件
+              csv_file <- paste0("Copula_Density_", basin, ".csv")
+              write.csv(density_data, csv_file, row.names = FALSE)
+              
+              # 更新摘要
+              density_summary <- rbind(density_summary, data.frame(
+                Basin = basin,
+                Copula_Type = best_copula,
+                Copula_Param = params,
+                Grid_Size = n_grid,
+                Data_Points = nrow(density_data),
+                Status = "成功",
+                stringsAsFactors = FALSE
+              ))
+              
+              cat(sprintf("  成功生成密度数据，保存到: %s\n", csv_file))
+              
+            }, error = function(e) {
+              cat(sprintf("  生成密度数据失败: %s\n", e$message))
+              density_summary <- rbind(density_summary, data.frame(
+                Basin = basin,
+                Copula_Type = best_copula,
+                Copula_Param = params,
+                Grid_Size = NA,
+                Data_Points = 0,
+                Status = paste("失败:", e$message),
+                stringsAsFactors = FALSE
+              ))
+            })
+          } else {
+            cat(sprintf("  无法创建Copula对象，参数可能无效\n"))
+            density_summary <- rbind(density_summary, data.frame(
+              Basin = basin,
+              Copula_Type = best_copula,
+              Copula_Param = NA,
+              Grid_Size = NA,
+              Data_Points = 0,
+              Status = "失败: 无效的Copula参数",
+              stringsAsFactors = FALSE
+            ))
+          }
+        } else {
+          cat(sprintf("  没有Copula结果\n"))
+          density_summary <- rbind(density_summary, data.frame(
+            Basin = basin,
+            Copula_Type = NA,
+            Copula_Param = NA,
+            Grid_Size = NA,
+            Data_Points = 0,
+            Status = "失败: 无Copula结果",
+            stringsAsFactors = FALSE
+          ))
+        }
+      }
+    }
+    
+    # 汇总结果
+    cat("\n===== Copula密度数据生成完成 =====\n")
+    cat(sprintf("成功生成密度数据的流域: %d/%d\n", 
+                sum(density_summary$Status == "成功"), nrow(density_summary)))
+    
+    # 保存密度数据摘要
+    write.csv(density_summary, "Copula_Density_Summary.csv", row.names = FALSE)
+    cat("密度数据摘要已保存到: Copula_Density_Summary.csv\n")
+    
+    # 保存所有密度数据到RData文件
+    if (length(density_data_list) > 0) {
+      save(density_data_list, file = "Copula_Density_Data.RData")
+      cat("所有密度数据已保存到: Copula_Density_Data.RData\n")
+      
+      # 输出密度数据统计信息
+      cat("\n===== 密度数据统计信息 =====\n")
+      cat(sprintf("生成的密度数据集数量: %d\n", length(density_data_list)))
+      
+      # 计算每个流域的密度统计
+      if (length(density_data_list) > 0) {
+        cat("\n前5个流域的密度统计:\n")
+        for (i in 1:min(5, length(density_data_list))) {
+          basin_name <- names(density_data_list)[i]
+          basin_data <- density_data_list[[i]]
+          
+          if (!is.null(basin_data$density_data)) {
+            density_stats <- summary(basin_data$density_data$density)
+            cat(sprintf("\n%s (%s, 参数=%.3f):\n", 
+                        basin_name, basin_data$copula_type, basin_data$copula_param))
+            print(density_stats)
+          }
+        }
+      }
+    } else {
+      cat("没有成功生成任何密度数据\n")
+    }
+    
+    # 返回密度数据列表
+    density_data_list
+  }
+}
